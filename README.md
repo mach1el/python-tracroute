@@ -8,6 +8,6 @@ This script will let you know how to trace route traffic by working with ICMP pa
 	pip install requests
 	
 ## Install to system (Linux only)
-* git clone
-*	sudo cp /usr/bin/ptraceroute
-* sudo chmod +x /usr/bin/ghostnet
+* git clone https://github.com/t7hm1/traceroute-py-script.git
+* sudo cp traceroute/ptraceroute /usr/bin/ptraceroute
+* sudo chmod +x /usr/bin/ptraceroute
