@@ -1,0 +1,233 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import json
+import time
+import select
+import operator
+import requests
+from random import *
+from struct import *
+from socket import *
+from functools import reduce
+
+def init(color,msg):
+    if color == "white":
+        return '\x1b[0m ' + str(msg)
+    else:
+        return '\033[1;91m ' + str(msg) + '\x1b[0m '
+
+def macth_ttl():
+    if sys.platform == 'linux2':
+        return 64
+    elif sys.platform == 'win32':
+        return 128
+    else:
+        return 255
+
+def macth_winz():
+    if sys.platform == 'linux2':
+        return 5840
+    elif sys.platform == 'win32':
+        return 8192
+    else:
+        return 4128
+
+
+class Builder(object):
+    def __init__(self, target, ttl, proto, dport=None, sport=None):
+        self.proto = proto
+        self.dport = dport
+        self.sport = sport
+
+        self.found = False
+        self.tries = 0
+        self.last_try = 0
+        self.remote_ip = None
+        self.remote_icmp = None
+        self.remote_host = None
+        self.location = ""
+
+        self.ttl = ttl
+        self.ip = iphdr(dst=target)
+        self.ip.ttl = ttl
+        self.ip.id += ttl
+        if self.proto == "icmp":
+            self.icmp = icmphdr('\x00' * 20)
+            self.icmp.id = self.ip.id
+            self.ip.data = self.icmp.assemble()
+
+        self._pkt = self.ip.assemble()
+
+    @property
+    def pkt(self):
+        return self._pkt
+
+class iphdr(object):
+    def __init__(self, proto=IPPROTO_ICMP, src="0.0.0.0", dst=None,id=None):
+        self.version = 4
+        self.hlen    = 5
+        self.tos     = 0
+        self.length  = 20
+        self.id = id
+        if self.id == None:
+            self.id = os.getpid() & 0xFFFF
+        self.frag    = 0
+        self.ttl     = 255
+        self.proto   = proto
+        self.cksum   = 0
+        self.src     = src
+        self.saddr   = inet_aton(src)
+        self.dst     = dst or "0.0.0.0"
+        self.daddr   = inet_aton(self.dst)
+        self.data    = ""
+
+    def assemble(self):
+        header = pack('BBHHHBB',
+            (self.version & 0x0f) << 4 | (self.hlen & 0x0f),
+            self.tos, self.length + len(self.data),
+            htons(self.id), self.frag,
+            self.ttl, self.proto)
+        self._raw = header + "\x00\x00".encode('ascii') + self.saddr + self.daddr + self.data
+        return self._raw
+
+    @classmethod
+    def disassemble(self, data):
+        self._raw  = data
+        ip         = iphdr(IPPROTO_TCP)
+        pkt        = unpack('!BBHHHBBH', data[:12])
+        ip.version = (pkt[0] >> 4 & 0x0f)
+        ip.hlen    = (pkt[0] & 0x0f)
+        ip.tos, ip.length, ip.id, ip.frag, ip.ttl, ip.proto, ip.cksum = pkt[1:]
+        ip.saddr   = data[12:16]
+        ip.daddr   = data[16:20]
+        ip.src     = inet_ntoa(ip.saddr)
+        ip.dst     = inet_ntoa(ip.daddr)
+        return ip
+
+    def __repr__(self):
+        return "IP (tos %s, ttl %s, id %s, frag %s, proto %s, length %s) " \
+               "%s -> %s" % \
+               (self.tos, self.ttl, self.id, self.frag, self.proto,
+                self.length, self.src, self.dst)
+
+class icmphdr(object):
+    def __init__(self, data=""):
+        self.type     = 8
+        self.code     = 0
+        self.cksum    = 0
+        self.id       = randint(2**10,2**16)
+        self.sequence = 0
+        self.data     = data.encode('ascii')
+
+    def assemble(self):
+        part1 = pack("BB", self.type, self.code)
+        part2 = pack("!HH", self.id, self.sequence)
+        cksum = self.checksum(part1 + "\x00\x00".encode('ascii') + part2 + self.data)
+        cksum = pack("!H", cksum)
+        self._raw = part1 + cksum + part2 + self.data
+        return self._raw
+
+    @classmethod
+    def checksum(self, data):
+        if len(data) & 1:
+            data += "\x00"
+        cksum = reduce(operator.add,
+                       unpack('!%dH' % (len(data) >> 1), data))
+        cksum = (cksum >> 16) + (cksum & 0xffff)
+        cksum += (cksum >> 16)
+        cksum = (cksum & 0xffff) ^ 0xffff
+        return cksum
+
+    @classmethod
+    def disassemble(self, data):
+        self._raw = data
+        icmp = icmphdr()
+        pkt = unpack("!BBHHH", data)
+        icmp.type, icmp.code, icmp.cksum, icmp.id, icmp.sequence = pkt
+        return icmp
+
+    def __repr__(self):
+        return "ICMP (type %s, code %s, id %s, sequence %s)" % \
+               (self.type, self.code, self.id, self.sequence)
+
+class Traceroute:
+    def __init__(self,tgt,hops):
+        self.tgt    = gethostbyname(tgt)
+        self.hops   = hops
+        self.to     = 2.0
+        self.recvto = pack('ll',2,0)
+
+    def resolver(self,addrs):
+        try:
+            host=gethostbyaddr(addrs)
+            mystr='{0} :: {1}'.format(addrs,host[0])
+        except:
+            mystr='{0} :: {0}'.format(addrs)
+        return mystr
+
+    def geoip(self,ip):
+        try:
+            r = requests.get('http://ip-api.com/json/'+ip)
+            rs = r.content
+            d = json.loads(rs)
+            try:
+                items = [d['country'],d['regionName'],d['city']]
+            except:
+                result = ""
+            else:
+                result=', '.join([x for x in items if x])
+                
+        except Exception as e:
+            print(init('red',e))
+        except KeyboardInterrupt:
+            sys.exit(init('red','[-] Canceled by user'))
+
+        return result
+
+    def _start_icmp(self):
+        for ttl in range(1,(self.hops+1)):
+            recver=socket(AF_INET,SOCK_RAW,IPPROTO_ICMP)
+            sender=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP)
+            sender.setsockopt(SOL_IP,IP_TTL,pack('I',ttl))
+            recver.bind(("",0))
+
+            try:
+                build_packet = Builder(self.tgt,ttl,'icmp')
+                pkt 		 = build_packet.pkt
+
+                port = randrange(33434,33460)
+                sender.sendto(pkt,(self.tgt,port))
+
+                t       = time.time()
+                started = time.time()
+                ready   = select.select([recver],[],[],self.to)
+                hmt 	= (time.time()-started)
+
+                if ready[0]==[]:
+                    sys.stdout.write('* ')
+                    continue
+                recvPkt,addrs=recver.recvfrom(65565)
+                timerecv=time.time()
+            except timeout:
+                pass
+            except KeyboardInterrupt:
+                sys.exit(init('red','[-] Canceled by user'))
+            else:
+                geoip=self.geoip(addrs[0])
+                print_result=self.resolver(addrs[0])
+                print('%d %.2fms %s :: %s' % (ttl,(timerecv-started),print_result,geoip))
+            finally:
+                sys.stdout.flush()
+                recver.close()
+                sender.close()
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit("Usage: %s [host] [hops]" % sys.argv[0])
+    else:
+        Traceroute(sys.argv[1],int(sys.argv[2]))._start_icmp()
+
+if __name__ == '__main__':
+    main()
